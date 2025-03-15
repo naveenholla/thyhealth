@@ -92,4 +92,29 @@ class AppDatabase extends _$AppDatabase {
     
     return result;
   }
+
+  // Delete operations for Patients
+  Future<int> deletePatient(int id) {
+    return (delete(patients)..where((p) => p.id.equals(id))).go();
+  }
+
+  // Delete operations for MedicalReports
+  Future<int> deleteMedicalReport(int id) {
+    return (delete(medicalReports)..where((r) => r.id.equals(id))).go();
+  }
+
+  // Delete all reports for a patient
+  Future<int> deleteReportsForPatient(int patientId) {
+    return (delete(medicalReports)..where((r) => r.patientId.equals(patientId))).go();
+  }
+
+  // Delete operations for TestResults
+  Future<int> deleteTestResult(int id) {
+    return (delete(testResults)..where((t) => t.id.equals(id))).go();
+  }
+
+  // Delete all test results for a report
+  Future<int> deleteTestResultsForReport(int reportId) {
+    return (delete(testResults)..where((t) => t.reportId.equals(reportId))).go();
+  }
 } 

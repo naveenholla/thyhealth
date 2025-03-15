@@ -12,25 +12,30 @@ class MedicalRepository {
     required String reportDate,
     String? originalFilePath,
     required List<Map<String, dynamic>> testResults,
+    int? existingPatientId,
   }) async {
     final db = await _provider.database;
     
     // Start a transaction to ensure all operations succeed or fail together
     return db.transaction(() async {
-      // Check if patient exists, create if not
-      final existingPatients = await (db.select(db.patients)
-        ..where((p) => p.name.equals(patientName)))
-        .get();
-      
+      // Use existing patient ID if provided, otherwise look up or create new patient
       int patientId;
-      if (existingPatients.isEmpty) {
-        // Create new patient
-        patientId = await db.addPatient(
-          PatientsCompanion.insert(name: patientName),
-        );
+      if (existingPatientId != null) {
+        patientId = existingPatientId;
       } else {
-        // Use existing patient
-        patientId = existingPatients.first.id;
+        final existingPatients = await (db.select(db.patients)
+          ..where((p) => p.name.equals(patientName)))
+          .get();
+        
+        if (existingPatients.isEmpty) {
+          // Create new patient
+          patientId = await db.addPatient(
+            PatientsCompanion.insert(name: patientName),
+          );
+        } else {
+          // Use existing patient
+          patientId = existingPatients.first.id;
+        }
       }
       
       // Create medical report
@@ -107,6 +112,39 @@ class MedicalRepository {
     yield* db.watchTestResultsByReportId(reportId);
   }
 
+  /// Delete a patient and all their associated data
+  Future<void> deletePatient(int patientId) async {
+    final db = await _provider.database;
+    await db.transaction(() async {
+      // First delete all test results for all reports of this patient
+      final reports = await db.getReportsByPatientId(patientId);
+      for (final report in reports) {
+        await db.deleteTestResultsForReport(report.id);
+      }
+      // Then delete all reports
+      await db.deleteReportsForPatient(patientId);
+      // Finally delete the patient
+      await db.deletePatient(patientId);
+    });
+  }
+
+  /// Delete a medical report and its test results
+  Future<void> deleteMedicalReport(int reportId) async {
+    final db = await _provider.database;
+    await db.transaction(() async {
+      // First delete all test results
+      await db.deleteTestResultsForReport(reportId);
+      // Then delete the report
+      await db.deleteMedicalReport(reportId);
+    });
+  }
+
+  /// Delete a specific test result
+  Future<void> deleteTestResult(int testResultId) async {
+    final db = await _provider.database;
+    await db.deleteTestResult(testResultId);
+  }
+
   /// Close the database
   Future<void> closeDatabase() async {
     await _provider.closeDatabase();
@@ -114,52 +152,37 @@ class MedicalRepository {
 
   /// Helper method to determine if a test result is abnormal
   bool _isAbnormalResult(String result, String? referenceRange) {
-    if (referenceRange == null || referenceRange.isEmpty) {
-      return false;
-    }
-
+    if (referenceRange == null) return false;
+    
     try {
       // Try to parse the result as a number
-      final numericResult = double.tryParse(result.replaceAll(RegExp(r'[^\d.]'), ''));
-      if (numericResult == null) {
-        return false;
-      }
+      final numericResult = double.tryParse(result.replaceAll(RegExp(r'[^0-9.]'), ''));
+      if (numericResult == null) return false;
 
       // Parse reference range
-      // Common formats: "10-20", "<10", ">20", "≤10", "≥20"
+      // Expected format: "X-Y" or "< X" or "> Y"
       if (referenceRange.contains('-')) {
         final parts = referenceRange.split('-');
         if (parts.length == 2) {
-          final min = double.tryParse(parts[0].trim().replaceAll(RegExp(r'[^\d.]'), ''));
-          final max = double.tryParse(parts[1].trim().replaceAll(RegExp(r'[^\d.]'), ''));
-          
+          final min = double.tryParse(parts[0].trim());
+          final max = double.tryParse(parts[1].trim());
           if (min != null && max != null) {
             return numericResult < min || numericResult > max;
           }
         }
       } else if (referenceRange.contains('<')) {
-        final max = double.tryParse(referenceRange.replaceAll('<', '').trim());
+        final max = double.tryParse(referenceRange.replaceAll(RegExp(r'[^0-9.]'), ''));
         if (max != null) {
           return numericResult >= max;
         }
       } else if (referenceRange.contains('>')) {
-        final min = double.tryParse(referenceRange.replaceAll('>', '').trim());
+        final min = double.tryParse(referenceRange.replaceAll(RegExp(r'[^0-9.]'), ''));
         if (min != null) {
           return numericResult <= min;
         }
-      } else if (referenceRange.contains('≤')) {
-        final max = double.tryParse(referenceRange.replaceAll('≤', '').trim());
-        if (max != null) {
-          return numericResult > max;
-        }
-      } else if (referenceRange.contains('≥')) {
-        final min = double.tryParse(referenceRange.replaceAll('≥', '').trim());
-        if (min != null) {
-          return numericResult < min;
-        }
       }
     } catch (e) {
-      // If parsing fails, assume it's not abnormal
+      // If any parsing fails, assume not abnormal
       return false;
     }
 

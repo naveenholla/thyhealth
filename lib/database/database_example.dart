@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
-import 'medical_repository.dart';
-import 'database.dart';
+import 'package:flutter/cupertino.dart';
+import 'dart:io' show Platform;
+import '../services/report_service.dart';
 
 /// Example widget to demonstrate how to use the MedicalRepository
 class DatabaseExample extends StatefulWidget {
@@ -11,199 +12,338 @@ class DatabaseExample extends StatefulWidget {
 }
 
 class _DatabaseExampleState extends State<DatabaseExample> {
-  final MedicalRepository _repository = MedicalRepository();
-  final Map<int, Stream<List<MedicalReport>>> _reportStreams = {};
-  
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Saved Medical Reports'),
-      ),
-      body: Column(
-        children: [
-          Expanded(
-            child: StreamBuilder<List<Patient>>(
-              stream: _repository.watchAllPatients().asBroadcastStream(),
-              builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-                
-                if (snapshot.hasError) {
-                  return Center(child: Text('Error: ${snapshot.error}'));
-                }
-                
-                final patients = snapshot.data ?? [];
-                
-                if (patients.isEmpty) {
-                  return const Center(child: Text('No patients found'));
-                }
-                
-                return ListView.builder(
-                  itemCount: patients.length,
-                  itemBuilder: (context, index) {
-                    final patient = patients[index];
-                    return ExpansionTile(
-                      title: Text(patient.name),
-                      subtitle: Text('Patient ID: ${patient.id}'),
-                      children: [
-                        _buildReportsList(patient.id),
-                      ],
-                    );
-                  },
-                );
+  final ReportService _reportService = ReportService();
+  int? _selectedPatientId;
+  int? _selectedReportId;
+
+  Future<void> _showDeleteConfirmation(BuildContext context, String title, String content, VoidCallback onConfirm) async {
+    if (Platform.isIOS) {
+      showCupertinoDialog(
+        context: context,
+        builder: (context) => CupertinoAlertDialog(
+          title: Text(title),
+          content: Text(content),
+          actions: [
+            CupertinoDialogAction(
+              isDestructiveAction: true,
+              onPressed: () {
+                Navigator.pop(context);
+                onConfirm();
               },
+              child: const Text('Delete'),
             ),
-          ),
-        ],
-      ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _addSampleData,
-        child: const Icon(Icons.add),
-      ),
-    );
+            CupertinoDialogAction(
+              child: const Text('Cancel'),
+              onPressed: () => Navigator.pop(context),
+            ),
+          ],
+        ),
+      );
+    } else {
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text(title),
+          content: Text(content),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                onConfirm();
+              },
+              style: TextButton.styleFrom(foregroundColor: Colors.red),
+              child: const Text('Delete'),
+            ),
+          ],
+        ),
+      );
+    }
   }
-  
-  Widget _buildReportsList(int patientId) {
-    // Get or create a broadcast stream for this patient
-    _reportStreams[patientId] ??= _repository.watchReportsByPatientId(patientId).asBroadcastStream();
-    
-    return StreamBuilder<List<MedicalReport>>(
-      stream: _reportStreams[patientId],
+
+  Widget _buildPatientsList() {
+    return FutureBuilder<List<dynamic>>(
+      future: _reportService.getAllPatients(),
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Center(child: CircularProgressIndicator());
         }
-        
+
         if (snapshot.hasError) {
           return Center(child: Text('Error: ${snapshot.error}'));
         }
-        
-        final reports = snapshot.data ?? [];
-        
-        if (reports.isEmpty) {
-          return const Padding(
-            padding: EdgeInsets.all(16.0),
-            child: Text('No reports found for this patient'),
-          );
+
+        final patients = snapshot.data ?? [];
+        if (patients.isEmpty) {
+          return const Center(child: Text('No patients found'));
         }
-        
+
         return ListView.builder(
-          shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-          itemCount: reports.length,
+          itemCount: patients.length,
           itemBuilder: (context, index) {
-            final report = reports[index];
+            final patient = patients[index];
             return ListTile(
-              title: Text('Report Date: ${report.reportDate}'),
-              subtitle: Text('Uploaded: ${report.uploadedAt}'),
-              onTap: () => _showReportDetails(report.id),
+              title: Text(patient.name),
+              subtitle: Text('Added: ${patient.createdAt.toString()}'),
+              selected: _selectedPatientId == patient.id,
+              onTap: () {
+                setState(() {
+                  _selectedPatientId = patient.id;
+                  _selectedReportId = null;
+                });
+              },
+              trailing: IconButton(
+                icon: Icon(
+                  Platform.isIOS ? CupertinoIcons.delete : Icons.delete,
+                  color: Colors.red,
+                ),
+                onPressed: () {
+                  _showDeleteConfirmation(
+                    context,
+                    'Delete Patient',
+                    'Are you sure you want to delete ${patient.name} and all their reports? This action cannot be undone.',
+                    () async {
+                      await _reportService.deletePatient(patient.id);
+                      setState(() {
+                        if (_selectedPatientId == patient.id) {
+                          _selectedPatientId = null;
+                          _selectedReportId = null;
+                        }
+                      });
+                    },
+                  );
+                },
+              ),
             );
           },
         );
       },
     );
   }
-  
-  void _showReportDetails(int reportId) async {
-    final reportWithResults = await _repository.getReportWithTestResults(reportId);
-    if (!mounted) return;
-    
-    if (reportWithResults.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No data found for this report')),
-      );
-      return;
+
+  Widget _buildReportsList() {
+    if (_selectedPatientId == null) {
+      return const Center(child: Text('Select a patient to view their reports'));
     }
-    
-    final report = reportWithResults.keys.first;
-    final results = reportWithResults.values.first;
-    
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text('Report from ${report.reportDate}'),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: ListView.builder(
-            shrinkWrap: true,
-            itemCount: results.length,
-            itemBuilder: (context, index) {
-              final result = results[index];
-              return ListTile(
-                title: Text(result.testName),
-                subtitle: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('Result: ${result.result}'),
-                    if (result.referenceRange != null)
-                      Text('Reference Range: ${result.referenceRange}'),
-                    if (result.foodSuggestions != null)
-                      Text('Food Suggestions: ${result.foodSuggestions}'),
-                  ],
+
+    return FutureBuilder<List<dynamic>>(
+      future: _reportService.getReportsByPatientId(_selectedPatientId!),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        if (snapshot.hasError) {
+          return Center(child: Text('Error: ${snapshot.error}'));
+        }
+
+        final reports = snapshot.data ?? [];
+        if (reports.isEmpty) {
+          return const Center(child: Text('No reports found for this patient'));
+        }
+
+        return ListView.builder(
+          itemCount: reports.length,
+          itemBuilder: (context, index) {
+            final report = reports[index];
+            return ListTile(
+              title: Text('Report Date: ${report.reportDate}'),
+              subtitle: Text('Uploaded: ${report.uploadedAt.toString()}'),
+              selected: _selectedReportId == report.id,
+              onTap: () {
+                setState(() {
+                  _selectedReportId = report.id;
+                });
+              },
+              trailing: IconButton(
+                icon: Icon(
+                  Platform.isIOS ? CupertinoIcons.delete : Icons.delete,
+                  color: Colors.red,
                 ),
-                tileColor: result.isAbnormal ? Colors.red.shade100 : null,
-              );
-            },
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Close'),
-          ),
-        ],
-      ),
+                onPressed: () {
+                  _showDeleteConfirmation(
+                    context,
+                    'Delete Report',
+                    'Are you sure you want to delete this report? This action cannot be undone.',
+                    () async {
+                      await _reportService.deleteMedicalReport(report.id);
+                      setState(() {
+                        if (_selectedReportId == report.id) {
+                          _selectedReportId = null;
+                        }
+                      });
+                    },
+                  );
+                },
+              ),
+            );
+          },
+        );
+      },
     );
   }
-  
-  // Add sample data for testing
-  Future<void> _addSampleData() async {
-    try {
-      await _repository.saveMedicalReport(
-        patientName: 'John Doe',
-        reportDate: '2023-05-15',
-        originalFilePath: null,
-        testResults: [
-          {
-            'test': 'Hemoglobin',
-            'result': '14.5 g/dL',
-            'reference_range': '13.5-17.5 g/dL',
-            'food_suggestions': 'ಕಬ್ಬಿಣಾಂಶ ಹೆಚ್ಚಿರುವ ಆಹಾರಗಳು: ಬೀಟ್‌ರೂಟ್, ಪಾಲಕ್, ಕಾಳುಮೆಣಸು',
-          },
-          {
-            'test': 'Glucose',
-            'result': '110 mg/dL',
-            'reference_range': '70-99 mg/dL',
-            'food_suggestions': 'ಸಕ್ಕರೆ ಕಡಿಮೆ ಇರುವ ಆಹಾರಗಳು: ಸೇಬು, ಬಾದಾಮಿ, ಕಡ್ಲೆಕಾಳು',
-          },
-          {
-            'test': 'Cholesterol',
-            'result': '220 mg/dL',
-            'reference_range': '<200 mg/dL',
-            'food_suggestions': 'ಕೊಬ್ಬು ಕಡಿಮೆ ಇರುವ ಆಹಾರಗಳು: ಮೀನು, ಓಟ್ಸ್, ಬೀನ್ಸ್',
-          },
-        ],
-      );
-      
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Sample data added successfully')),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error adding sample data: $e')),
-        );
-      }
+
+  Widget _buildTestResultsList() {
+    if (_selectedReportId == null) {
+      return const Center(child: Text('Select a report to view test results'));
     }
+
+    return FutureBuilder<Map<dynamic, List<dynamic>>>(
+      future: _reportService.getReportWithTestResults(_selectedReportId!),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        if (snapshot.hasError) {
+          return Center(child: Text('Error: ${snapshot.error}'));
+        }
+
+        final data = snapshot.data;
+        if (data == null || data.isEmpty) {
+          return const Center(child: Text('No test results found for this report'));
+        }
+
+        final testResults = data.values.first;
+        return ListView.builder(
+          itemCount: testResults.length,
+          itemBuilder: (context, index) {
+            final result = testResults[index];
+            return ListTile(
+              title: Text(result.testName),
+              subtitle: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Result: ${result.result}'),
+                  if (result.referenceRange != null)
+                    Text('Reference Range: ${result.referenceRange}'),
+                  if (result.foodSuggestions != null)
+                    Text('Food Suggestions: ${result.foodSuggestions}'),
+                ],
+              ),
+              trailing: IconButton(
+                icon: Icon(
+                  Platform.isIOS ? CupertinoIcons.delete : Icons.delete,
+                  color: Colors.red,
+                ),
+                onPressed: () {
+                  _showDeleteConfirmation(
+                    context,
+                    'Delete Test Result',
+                    'Are you sure you want to delete this test result? This action cannot be undone.',
+                    () async {
+                      await _reportService.deleteTestResult(result.id);
+                      setState(() {}); // Refresh the view
+                    },
+                  );
+                },
+              ),
+            );
+          },
+        );
+      },
+    );
   }
-  
+
   @override
-  void dispose() {
-    _repository.closeDatabase();
-    super.dispose();
+  Widget build(BuildContext context) {
+    if (Platform.isIOS) {
+      return CupertinoPageScaffold(
+        navigationBar: const CupertinoNavigationBar(
+          middle: Text('Medical Reports'),
+        ),
+        child: SafeArea(
+          child: Row(
+            children: [
+              Expanded(
+                flex: 1,
+                child: Column(
+                  children: [
+                    const Padding(
+                      padding: EdgeInsets.all(8.0),
+                      child: Text('Patients'),
+                    ),
+                    Expanded(child: _buildPatientsList()),
+                  ],
+                ),
+              ),
+              Expanded(
+                flex: 1,
+                child: Column(
+                  children: [
+                    const Padding(
+                      padding: EdgeInsets.all(8.0),
+                      child: Text('Reports'),
+                    ),
+                    Expanded(child: _buildReportsList()),
+                  ],
+                ),
+              ),
+              Expanded(
+                flex: 2,
+                child: Column(
+                  children: [
+                    const Padding(
+                      padding: EdgeInsets.all(8.0),
+                      child: Text('Test Results'),
+                    ),
+                    Expanded(child: _buildTestResultsList()),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    } else {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('Medical Reports'),
+        ),
+        body: Row(
+          children: [
+            Expanded(
+              flex: 1,
+              child: Column(
+                children: [
+                  const Padding(
+                    padding: EdgeInsets.all(8.0),
+                    child: Text('Patients'),
+                  ),
+                  Expanded(child: _buildPatientsList()),
+                ],
+              ),
+            ),
+            Expanded(
+              flex: 1,
+              child: Column(
+                children: [
+                  const Padding(
+                    padding: EdgeInsets.all(8.0),
+                    child: Text('Reports'),
+                  ),
+                  Expanded(child: _buildReportsList()),
+                ],
+              ),
+            ),
+            Expanded(
+              flex: 2,
+              child: Column(
+                children: [
+                  const Padding(
+                    padding: EdgeInsets.all(8.0),
+                    child: Text('Test Results'),
+                  ),
+                  Expanded(child: _buildTestResultsList()),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+    }
   }
 } 

@@ -7,7 +7,7 @@ class ReportService {
   final MedicalRepository _repository = MedicalRepository();
   
   /// Save a medical report from JSON data
-  Future<int> saveReportFromJson(String jsonData, {String? originalFilePath}) async {
+  Future<int> saveReportFromJson(String jsonData, {String? originalFilePath, int? patientId}) async {
     try {
       // Parse the JSON data
       final data = jsonDecode(jsonData);
@@ -28,6 +28,7 @@ class ReportService {
         reportDate: reportDate,
         originalFilePath: originalFilePath,
         testResults: testResults,
+        existingPatientId: patientId,
       );
     } catch (e) {
       rethrow;
@@ -40,6 +41,7 @@ class ReportService {
     required String reportDate,
     required List<Map<String, dynamic>> testResults,
     String? originalFilePath,
+    int? existingPatientId,
   }) async {
     try {
       return await _repository.saveMedicalReport(
@@ -47,6 +49,7 @@ class ReportService {
         reportDate: reportDate,
         originalFilePath: originalFilePath,
         testResults: testResults,
+        existingPatientId: existingPatientId,
       );
     } catch (e) {
       rethrow;
@@ -68,6 +71,21 @@ class ReportService {
     return await _repository.getReportWithTestResults(reportId);
   }
   
+  /// Delete a patient and all their associated data
+  Future<void> deletePatient(int patientId) async {
+    await _repository.deletePatient(patientId);
+  }
+
+  /// Delete a medical report and its test results
+  Future<void> deleteMedicalReport(int reportId) async {
+    await _repository.deleteMedicalReport(reportId);
+  }
+
+  /// Delete a specific test result
+  Future<void> deleteTestResult(int testResultId) async {
+    await _repository.deleteTestResult(testResultId);
+  }
+
   /// Close the database
   Future<void> closeDatabase() async {
     await _repository.closeDatabase();
