@@ -1,0 +1,12 @@
+{
+  "name": "thyhealth-dev-server",
+  "version": "1.0.0",
+  "description": "Development server for ThyHealth web app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.3"
+  }
+} 
