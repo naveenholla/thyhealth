@@ -8,14 +8,29 @@ import 'package:google_generative_ai/google_generative_ai.dart';
 import 'database/database_example.dart'; // Import the database example
 import 'services/report_service.dart'; // Import the report service
 import 'pages/profile_selection_page.dart';
+import 'dart:async';
+import 'dart:math';
+import 'dart:collection';
+
+class _ProcessingQueueItem {
+  final PlatformFile file;
+  final int attemptNumber;
+  final DateTime timestamp;
+
+  _ProcessingQueueItem({
+    required this.file,
+    this.attemptNumber = 1,
+    DateTime? timestamp,
+  }) : timestamp = timestamp ?? DateTime.now();
+}
 
 Future<void> main() async {
   // Ensure Flutter bindings are initialized
   WidgetsFlutterBinding.ensureInitialized();
-  
+
   // Load environment variables
   await dotenv.load(fileName: '.env');
-  
+
   runApp(const MyApp());
 }
 
@@ -25,13 +40,26 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (Platform.isIOS) {
-      return CupertinoApp(
-        title: 'Medical Report Analyzer',
-        theme: const CupertinoThemeData(
-          primaryColor: CupertinoColors.systemBlue,
-          brightness: Brightness.light,
+      return MaterialApp(
+        home: Builder(
+          builder:
+              (context) => CupertinoApp(
+                title: 'Medical Report Analyzer',
+                theme: const CupertinoThemeData(
+                  primaryColor: CupertinoColors.systemBlue,
+                  brightness: Brightness.light,
+                ),
+                localizationsDelegates: const [
+                  DefaultMaterialLocalizations.delegate,
+                  DefaultCupertinoLocalizations.delegate,
+                  DefaultWidgetsLocalizations.delegate,
+                ],
+                supportedLocales: const [
+                  Locale('en', ''), // English
+                ],
+                home: const ProfileSelectionPage(),
+              ),
         ),
-        home: const ProfileSelectionPage(),
       );
     } else {
       return MaterialApp(
@@ -50,6 +78,14 @@ class MyApp extends StatelessWidget {
           ),
           useMaterial3: true,
         ),
+        localizationsDelegates: const [
+          DefaultMaterialLocalizations.delegate,
+          DefaultCupertinoLocalizations.delegate,
+          DefaultWidgetsLocalizations.delegate,
+        ],
+        supportedLocales: const [
+          Locale('en', ''), // English
+        ],
         home: const ProfileSelectionPage(),
       );
     }
@@ -70,22 +106,60 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
   List<Map<String, dynamic>> _results = [];
   String _patientName = '';
   String _reportDate = '';
-  final ReportService _reportService = ReportService(); // Add report service
+  final ReportService _reportService = ReportService();
   final TextEditingController _apiKeyController = TextEditingController();
   int _selectedIndex = 0;
   bool _isExtended = true;
-  final String _defaultPrompt = 'Extract the following information from this medical report:\n1. Patient name\n2. Report date\n3. All test results\n\nadd food suggestions (in kannada) also for each of the test which will help to get in normal range\n\nReturn the data in this JSON format:\n{\n  "patient_info": {"name": "Patient Name", "date": "Report Date"},\n  "test_results": [{"test": "Test Name", "result": "Result Value", "reference_range": "Normal Range", "food_suggestions": "Food Suggestions"}]\n}';
+  final String _defaultPrompt =
+      'Extract the following information from this medical report:\n1. Patient name\n2. Report date\n3. All test results\n\nadd food suggestions (in kannada) also for each of the test which will help to get in normal range\n\nReturn the data in this JSON format:\n{\n  "patient_info": {"name": "Patient Name", "date": "Report Date"},\n  "test_results": [{"test": "Test Name", "result": "Result Value", "reference_range": "Normal Range", "food_suggestions": "Food Suggestions"}]\n}';
   Map<String, Map<String, dynamic>> _patientReports = {};
   List<String> _selectedPatient = [];
+  final Map<String, int> _retryAttempts = {};
+  final Map<String, Timer> _retryTimers = {};
+  final int _maxRetries = 3;
+  final Duration _initialRetryDelay = const Duration(seconds: 30);
+  final Queue<_ProcessingQueueItem> _processingQueue =
+      Queue<_ProcessingQueueItem>();
+  bool _isProcessingQueue = false;
 
-  // Add helper function to normalize patient names
+  // Update the name normalization function to be more comprehensive
   String _normalizePatientName(String name) {
-    // Remove Mr., Mrs., and extra spaces
-    return name
-      .replaceAll(RegExp(r'^Mr\.\s*', caseSensitive: false), '')
-      .replaceAll(RegExp(r'^Mrs\.\s*', caseSensitive: false), '')
-      .replaceAll(RegExp(r'\s+'), ' ')
-      .trim();
+    // Convert to lowercase first for case-insensitive comparison
+    String normalized = name.toLowerCase();
+
+    // Remove common prefixes
+    final prefixes = [
+      'mr.',
+      'mr ',
+      'mrs.',
+      'mrs ',
+      'miss.',
+      'miss ',
+      'ms.',
+      'ms ',
+      'dr.',
+      'dr ',
+    ];
+
+    for (final prefix in prefixes) {
+      if (normalized.startsWith(prefix)) {
+        normalized = normalized.substring(prefix.length);
+      }
+    }
+
+    // Remove extra spaces and trim
+    normalized = normalized.replaceAll(RegExp(r'\s+'), ' ').trim();
+
+    // Capitalize each word
+    normalized = normalized
+        .split(' ')
+        .map((word) {
+          if (word.isEmpty) return '';
+          return word[0].toUpperCase() + word.substring(1).toLowerCase();
+        })
+        .join(' ');
+
+    return normalized;
   }
 
   @override
@@ -97,7 +171,9 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
   @override
   void dispose() {
     _apiKeyController.dispose();
-    _reportService.closeDatabase(); // Close the database when disposing
+    _reportService.closeDatabase();
+    // Cancel all retry timers
+    _retryTimers.values.forEach((timer) => timer.cancel());
     super.dispose();
   }
 
@@ -123,6 +199,187 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
     }
   }
 
+  Future<void> _processFile(PlatformFile file, {int attemptNumber = 1}) async {
+    try {
+      final model = GenerativeModel(
+        model: 'gemini-1.5-pro',
+        apiKey: dotenv.env['GEMINI_API_KEY'] ?? '',
+      );
+
+      final List<Content> contentParts = [
+        Content.text(_defaultPrompt),
+        Content.data(
+          file.extension?.toLowerCase() == 'pdf'
+              ? 'application/pdf'
+              : 'image/${file.extension?.toLowerCase() ?? 'jpeg'}',
+          file.bytes!,
+        ),
+      ];
+
+      final response = await model.generateContent(contentParts);
+      final responseText = response.text;
+
+      if (responseText != null) {
+        String jsonStr = responseText;
+        if (responseText.contains('```')) {
+          final codeBlockMatch = RegExp(
+            r'```(?:json)?\s*([\s\S]*?)\s*```',
+          ).firstMatch(responseText);
+          if (codeBlockMatch != null && codeBlockMatch.group(1) != null) {
+            jsonStr = codeBlockMatch.group(1)!.trim();
+          }
+        }
+
+        final parsedData = jsonDecode(jsonStr);
+        if (parsedData is Map<String, dynamic>) {
+          setState(() {
+            _updateResults(parsedData, file);
+          });
+        }
+      }
+
+      // Clear retry attempts on success
+      _retryAttempts.remove(file.name);
+      _retryTimers[file.name]?.cancel();
+      _retryTimers.remove(file.name);
+    } catch (e) {
+      print('Error processing file ${file.name}: $e');
+
+      if (e.toString().contains('Resource has been exhausted') ||
+          e.toString().contains('quota')) {
+        _handleQuotaError(file, attemptNumber);
+      } else {
+        // Handle other errors
+        setState(() {
+          _error = 'Error processing ${file.name}: ${e.toString()}';
+        });
+      }
+    }
+  }
+
+  void _handleQuotaError(PlatformFile file, int attemptNumber) {
+    if (attemptNumber < _maxRetries) {
+      // Calculate exponential backoff delay
+      final delay = _initialRetryDelay * pow(2, attemptNumber - 1);
+
+      // Add to processing queue
+      _processingQueue.add(
+        _ProcessingQueueItem(
+          file: file,
+          attemptNumber: attemptNumber + 1,
+          timestamp: DateTime.now().add(delay),
+        ),
+      );
+
+      // Show retry notification
+      if (mounted) {
+        _showRetryNotification(file.name, delay);
+      }
+
+      // Start queue processor if not already running
+      if (!_isProcessingQueue) {
+        _startQueueProcessor();
+      }
+    } else {
+      setState(() {
+        _error = 'Failed to process ${file.name} after $_maxRetries attempts';
+      });
+    }
+  }
+
+  void _showRetryNotification(String fileName, Duration delay) {
+    if (Platform.isIOS) {
+      showCupertinoDialog(
+        context: context,
+        builder:
+            (context) => CupertinoAlertDialog(
+              title: const Text('Processing Delayed'),
+              content: Text(
+                '$fileName will be retried in ${delay.inSeconds} seconds due to API quota limits.',
+              ),
+              actions: [
+                CupertinoDialogAction(
+                  child: const Text('OK'),
+                  onPressed: () => Navigator.pop(context),
+                ),
+              ],
+            ),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '$fileName will be retried in ${delay.inSeconds} seconds',
+          ),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
+  }
+
+  void _startQueueProcessor() {
+    if (_isProcessingQueue) return;
+    _isProcessingQueue = true;
+
+    Timer.periodic(const Duration(seconds: 5), (timer) {
+      if (_processingQueue.isEmpty) {
+        timer.cancel();
+        _isProcessingQueue = false;
+        return;
+      }
+
+      final now = DateTime.now();
+      final itemsToProcess = <_ProcessingQueueItem>[];
+
+      // Find items ready to process
+      while (_processingQueue.isNotEmpty &&
+          _processingQueue.first.timestamp.isBefore(now)) {
+        itemsToProcess.add(_processingQueue.removeFirst());
+      }
+
+      // Process ready items
+      for (final item in itemsToProcess) {
+        _processFile(item.file, attemptNumber: item.attemptNumber);
+      }
+    });
+  }
+
+  void _updateResults(Map<String, dynamic> parsedData, PlatformFile file) {
+    final rawPatientName =
+        parsedData['patient_info']?['name']?.toString() ?? 'Unknown Patient';
+    final normalizedName = _normalizePatientName(rawPatientName);
+    final reportDate =
+        parsedData['patient_info']?['date']?.toString() ?? 'Unknown Date';
+
+    // Check if we already have a report for this patient (using normalized name)
+    if (!_patientReports.containsKey(normalizedName)) {
+      _patientReports[normalizedName] = {
+        'dates': <String>{},
+        'results': <Map<String, dynamic>>[],
+        'original_names': <String>{rawPatientName},
+        'display_name':
+            normalizedName, // Store the normalized name as display name
+      };
+    } else {
+      // Only add the original name if it's different from what we have
+      if (!_patientReports[normalizedName]!['original_names'].contains(
+        rawPatientName,
+      )) {
+        _patientReports[normalizedName]!['original_names'].add(rawPatientName);
+      }
+    }
+
+    _patientReports[normalizedName]!['dates'].add(reportDate);
+
+    if (parsedData['test_results'] != null) {
+      final List<Map<String, dynamic>> fileResults =
+          List<Map<String, dynamic>>.from(parsedData['test_results']);
+      _patientReports[normalizedName]!['results'].addAll(fileResults);
+    }
+
+    _selectedPatient = _patientReports.keys.toList()..sort();
+  }
+
   Future<void> _processFiles() async {
     if (_selectedFiles.isEmpty) {
       setState(() {
@@ -140,76 +397,13 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
         _selectedPatient = [];
       });
 
-      // Initialize Gemini API with your API key from .env file
-      final model = GenerativeModel(
-        model: 'gemini-1.5-pro',
-        apiKey: dotenv.env['GEMINI_API_KEY'] ?? '',
-      );
-
       // Process each file individually
       for (final file in _selectedFiles) {
-        try {
-          // Create content parts for the current file
-          final List<Content> contentParts = [
-            Content.text(_defaultPrompt),
-            Content.data(
-              file.extension?.toLowerCase() == 'pdf' 
-                  ? 'application/pdf' 
-                  : 'image/${file.extension?.toLowerCase() ?? 'jpeg'}',
-              file.bytes!
-            ),
-          ];
-
-          final response = await model.generateContent(contentParts);
-          final responseText = response.text;
-
-          if (responseText != null) {
-            String jsonStr = responseText;
-            if (responseText.contains('```')) {
-              final codeBlockMatch = RegExp(r'```(?:json)?\s*([\s\S]*?)\s*```').firstMatch(responseText);
-              if (codeBlockMatch != null && codeBlockMatch.group(1) != null) {
-                jsonStr = codeBlockMatch.group(1)!.trim();
-              }
-            }
-
-            final parsedData = jsonDecode(jsonStr);
-            if (parsedData is Map<String, dynamic>) {
-              final rawPatientName = parsedData['patient_info']?['name']?.toString() ?? 'Unknown Patient';
-              final patientName = _normalizePatientName(rawPatientName);
-              final reportDate = parsedData['patient_info']?['date']?.toString() ?? 'Unknown Date';
-              
-              if (!_patientReports.containsKey(patientName)) {
-                _patientReports[patientName] = {
-                  'dates': <String>{},
-                  'results': <Map<String, dynamic>>[],
-                  'original_names': <String>{rawPatientName}, // Store original names
-                };
-              } else {
-                // Add this original name to the set of names for this patient
-                _patientReports[patientName]!['original_names'].add(rawPatientName);
-              }
-              
-              _patientReports[patientName]!['dates'].add(reportDate);
-              
-              // Add test results to the patient's results list
-              if (parsedData['test_results'] != null) {
-                final List<Map<String, dynamic>> fileResults = 
-                    List<Map<String, dynamic>>.from(parsedData['test_results']);
-                _patientReports[patientName]!['results'].addAll(fileResults);
-              }
-            }
-          }
-        } catch (e) {
-          // Log error for this file but continue processing others
-          print('Error processing file ${file.name}: $e');
-        }
+        await _processFile(file);
       }
 
       setState(() {
-        _selectedPatient = _patientReports.keys.toList();
         _isLoading = false;
-        
-        // Save reports for each patient
         _saveAllReportsToDatabase();
       });
     } catch (e) {
@@ -230,26 +424,31 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           decoration: const BoxDecoration(
             border: Border(
-              bottom: BorderSide(
-                color: CupertinoColors.systemGrey5,
-              ),
+              bottom: BorderSide(color: CupertinoColors.systemGrey5),
             ),
           ),
           child: Row(
-            children: results.first.keys.map((header) {
-              return Expanded(
-                child: Text(
-                  header.toString().split('_').map((word) =>
-                    word[0].toUpperCase() + word.substring(1).toLowerCase()
-                  ).join(' '),
-                  style: const TextStyle(
-                    fontWeight: FontWeight.w600,
-                    fontSize: 15,
-                    color: CupertinoColors.secondaryLabel,
-                  ),
-                ),
-              );
-            }).toList(),
+            children:
+                results.first.keys.map((header) {
+                  return Expanded(
+                    child: Text(
+                      header
+                          .toString()
+                          .split('_')
+                          .map(
+                            (word) =>
+                                word[0].toUpperCase() +
+                                word.substring(1).toLowerCase(),
+                          )
+                          .join(' '),
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w600,
+                        fontSize: 15,
+                        color: CupertinoColors.secondaryLabel,
+                      ),
+                    ),
+                  );
+                }).toList(),
           ),
         ),
         // Data rows
@@ -258,26 +457,25 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
             decoration: const BoxDecoration(
               border: Border(
-                bottom: BorderSide(
-                  color: CupertinoColors.systemGrey5,
-                ),
+                bottom: BorderSide(color: CupertinoColors.systemGrey5),
               ),
             ),
             child: Row(
-              children: result.values.map((value) {
-                return Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 8.0),
-                    child: Text(
-                      value?.toString() ?? '',
-                      style: const TextStyle(
-                        fontSize: 15,
-                        color: CupertinoColors.label,
+              children:
+                  result.values.map((value) {
+                    return Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8.0),
+                        child: Text(
+                          value?.toString() ?? '',
+                          style: const TextStyle(
+                            fontSize: 15,
+                            color: CupertinoColors.label,
+                          ),
+                        ),
                       ),
-                    ),
-                  ),
-                );
-              }).toList(),
+                    );
+                  }).toList(),
             ),
           );
         }).toList(),
@@ -291,21 +489,28 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
       for (final patientName in _patientReports.keys) {
         final patientData = _patientReports[patientName]!;
         final reportDates = (patientData['dates'] as Set<String>).toList();
-        
+
         // Save report for each date
         for (final reportDate in reportDates) {
           await _reportService.saveReport(
             patientName: patientName,
             reportDate: reportDate,
-            testResults: List<Map<String, dynamic>>.from(patientData['results']),
-            originalFilePath: _selectedFiles.firstWhere((file) => 
-              file.name.contains(patientName) || file.name.contains(reportDate),
-              orElse: () => _selectedFiles.first,
-            ).path,
+            testResults: List<Map<String, dynamic>>.from(
+              patientData['results'],
+            ),
+            originalFilePath:
+                _selectedFiles
+                    .firstWhere(
+                      (file) =>
+                          file.name.contains(patientName) ||
+                          file.name.contains(reportDate),
+                      orElse: () => _selectedFiles.first,
+                    )
+                    .path,
           );
         }
       }
-      
+
       // Show a success message
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -343,14 +548,19 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
   }
 
   // Update the results display to show all name variations
-  Widget _buildResultsForPatient(String patientName, Map<String, dynamic> patientData) {
+  Widget _buildResultsForPatient(
+    String patientName,
+    Map<String, dynamic> patientData,
+  ) {
     final dates = (patientData['dates'] as Set<String>).toList()..sort();
     final results = List<Map<String, dynamic>>.from(patientData['results']);
-    final originalNames = (patientData['original_names'] as Set<String>).toList()..sort();
-    final displayName = originalNames.length > 1 
-        ? '$patientName (also known as: ${originalNames.where((n) => n != patientName).join(", ")})'
-        : patientName;
-    
+    final originalNames =
+        (patientData['original_names'] as Set<String>).toList()..sort();
+    final displayName =
+        originalNames.length > 1
+            ? '$patientName (also known as: ${originalNames.where((n) => n != patientName).join(", ")})'
+            : patientName;
+
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16.0),
@@ -380,9 +590,10 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
             const SizedBox(height: 16),
             SingleChildScrollView(
               scrollDirection: Axis.horizontal,
-              child: results.isEmpty
-                  ? const Text('No test results found')
-                  : CupertinoTableView(results: results),
+              child:
+                  results.isEmpty
+                      ? const Text('No test results found')
+                      : CupertinoTableView(results: results),
             ),
           ],
         ),
@@ -393,7 +604,7 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
   // Update the analysis panel to show multiple patient results
   Widget _buildAnalysisPanel() {
     final isSmallScreen = MediaQuery.of(context).size.width < 600;
-    
+
     return SafeArea(
       child: CustomScrollView(
         slivers: [
@@ -416,11 +627,14 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                       label: const Text('Select Files'),
                     ),
                     FilledButton.icon(
-                      onPressed: _isLoading || _selectedFiles.isEmpty
-                          ? null
-                          : _processFiles,
+                      onPressed:
+                          _isLoading || _selectedFiles.isEmpty
+                              ? null
+                              : _processFiles,
                       icon: const Icon(Icons.analytics),
-                      label: Text(_isLoading ? 'Processing...' : 'Analyze Files'),
+                      label: Text(
+                        _isLoading ? 'Processing...' : 'Analyze Files',
+                      ),
                     ),
                   ],
                 ),
@@ -440,15 +654,25 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                           Wrap(
                             spacing: 8,
                             runSpacing: 8,
-                            children: _selectedFiles.map((file) => Chip(
-                              avatar: const Icon(Icons.description, size: 16),
-                              label: Text(file.name),
-                              onDeleted: () {
-                                setState(() {
-                                  _selectedFiles.removeWhere((f) => f.name == file.name);
-                                });
-                              },
-                            )).toList(),
+                            children:
+                                _selectedFiles
+                                    .map(
+                                      (file) => Chip(
+                                        avatar: const Icon(
+                                          Icons.description,
+                                          size: 16,
+                                        ),
+                                        label: Text(file.name),
+                                        onDeleted: () {
+                                          setState(() {
+                                            _selectedFiles.removeWhere(
+                                              (f) => f.name == file.name,
+                                            );
+                                          });
+                                        },
+                                      ),
+                                    )
+                                    .toList(),
                           ),
                         ],
                       ),
@@ -484,9 +708,12 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                   ),
                 if (_patientReports.isNotEmpty) ...[
                   const SizedBox(height: 24),
-                  ...(_patientReports.entries.map((entry) => 
-                    _buildResultsForPatient(entry.key, entry.value)).toList()
-                  ),
+                  ...(_patientReports.entries
+                      .map(
+                        (entry) =>
+                            _buildResultsForPatient(entry.key, entry.value),
+                      )
+                      .toList()),
                 ],
               ]),
             ),
@@ -525,7 +752,9 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
             if (index == 1) {
               Navigator.push(
                 context,
-                CupertinoPageRoute(builder: (context) => const DatabaseExample()),
+                CupertinoPageRoute(
+                  builder: (context) => const DatabaseExample(),
+                ),
               ).then((_) {
                 setState(() {
                   _selectedIndex = 0;
@@ -577,7 +806,9 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                       });
                     },
                     child: Icon(
-                      _isExtended ? CupertinoIcons.sidebar_left : CupertinoIcons.sidebar_right,
+                      _isExtended
+                          ? CupertinoIcons.sidebar_left
+                          : CupertinoIcons.sidebar_right,
                       color: CupertinoColors.activeBlue,
                     ),
                   ),
@@ -586,7 +817,10 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                       padding: const EdgeInsets.all(16.0),
                       child: Text(
                         'Medical Report\nAnalyzer',
-                        style: CupertinoTheme.of(context).textTheme.navTitleTextStyle,
+                        style:
+                            CupertinoTheme.of(
+                              context,
+                            ).textTheme.navTitleTextStyle,
                         textAlign: TextAlign.center,
                       ),
                     ),
@@ -615,9 +849,10 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
               ),
             ),
             Expanded(
-              child: _selectedIndex == 2
-                  ? _buildIOSSettingsPanel()
-                  : _buildIOSAnalysisPanel(),
+              child:
+                  _selectedIndex == 2
+                      ? _buildIOSSettingsPanel()
+                      : _buildIOSAnalysisPanel(),
             ),
           ],
         ),
@@ -656,14 +891,20 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
         children: [
           Icon(
             icon,
-            color: isSelected ? CupertinoColors.activeBlue : CupertinoColors.inactiveGray,
+            color:
+                isSelected
+                    ? CupertinoColors.activeBlue
+                    : CupertinoColors.inactiveGray,
           ),
           if (_isExtended) ...[
             const SizedBox(width: 8),
             Text(
               label,
               style: TextStyle(
-                color: isSelected ? CupertinoColors.activeBlue : CupertinoColors.inactiveGray,
+                color:
+                    isSelected
+                        ? CupertinoColors.activeBlue
+                        : CupertinoColors.inactiveGray,
               ),
             ),
           ],
@@ -674,11 +915,9 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
 
   Widget _buildIOSAnalysisPanel() {
     final isSmallScreen = MediaQuery.of(context).size.width < 600;
-    
+
     return CupertinoPageScaffold(
-      navigationBar: const CupertinoNavigationBar(
-        middle: Text('Analysis'),
-      ),
+      navigationBar: const CupertinoNavigationBar(middle: Text('Analysis')),
       child: SafeArea(
         child: SingleChildScrollView(
           child: Padding(
@@ -694,10 +933,13 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                     ),
                     const SizedBox(width: 16),
                     CupertinoButton.filled(
-                      onPressed: _isLoading || _selectedFiles.isEmpty
-                          ? null
-                          : _processFiles,
-                      child: Text(_isLoading ? 'Processing...' : 'Analyze Files'),
+                      onPressed:
+                          _isLoading || _selectedFiles.isEmpty
+                              ? null
+                              : _processFiles,
+                      child: Text(
+                        _isLoading ? 'Processing...' : 'Analyze Files',
+                      ),
                     ),
                   ],
                 ),
@@ -724,48 +966,55 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                         Wrap(
                           spacing: 8,
                           runSpacing: 8,
-                          children: _selectedFiles.map((file) => Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 12,
-                              vertical: 6,
-                            ),
-                            decoration: BoxDecoration(
-                              color: CupertinoColors.systemGrey6,
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                const Icon(
-                                  CupertinoIcons.doc,
-                                  size: 16,
-                                  color: CupertinoColors.systemGrey,
-                                ),
-                                const SizedBox(width: 6),
-                                Text(
-                                  file.name,
-                                  style: const TextStyle(
-                                    color: CupertinoColors.label,
-                                  ),
-                                ),
-                                const SizedBox(width: 6),
-                                CupertinoButton(
-                                  padding: EdgeInsets.zero,
-                                  minSize: 0,
-                                  onPressed: () {
-                                    setState(() {
-                                      _selectedFiles.removeWhere((f) => f.name == file.name);
-                                    });
-                                  },
-                                  child: const Icon(
-                                    CupertinoIcons.xmark_circle_fill,
-                                    size: 16,
-                                    color: CupertinoColors.systemGrey,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          )).toList(),
+                          children:
+                              _selectedFiles
+                                  .map(
+                                    (file) => Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 12,
+                                        vertical: 6,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: CupertinoColors.systemGrey6,
+                                        borderRadius: BorderRadius.circular(8),
+                                      ),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          const Icon(
+                                            CupertinoIcons.doc,
+                                            size: 16,
+                                            color: CupertinoColors.systemGrey,
+                                          ),
+                                          const SizedBox(width: 6),
+                                          Text(
+                                            file.name,
+                                            style: const TextStyle(
+                                              color: CupertinoColors.label,
+                                            ),
+                                          ),
+                                          const SizedBox(width: 6),
+                                          CupertinoButton(
+                                            padding: EdgeInsets.zero,
+                                            minSize: 0,
+                                            onPressed: () {
+                                              setState(() {
+                                                _selectedFiles.removeWhere(
+                                                  (f) => f.name == file.name,
+                                                );
+                                              });
+                                            },
+                                            child: const Icon(
+                                              CupertinoIcons.xmark_circle_fill,
+                                              size: 16,
+                                              color: CupertinoColors.systemGrey,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  )
+                                  .toList(),
                         ),
                       ],
                     ),
@@ -779,7 +1028,9 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                       decoration: BoxDecoration(
                         color: CupertinoColors.systemRed.withOpacity(0.1),
                         borderRadius: BorderRadius.circular(10),
-                        border: Border.all(color: CupertinoColors.systemRed.withOpacity(0.3)),
+                        border: Border.all(
+                          color: CupertinoColors.systemRed.withOpacity(0.3),
+                        ),
                       ),
                       child: Row(
                         children: [
@@ -802,9 +1053,12 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                   ),
                 if (_patientReports.isNotEmpty) ...[
                   const SizedBox(height: 24),
-                  ...(_patientReports.entries.map((entry) => 
-                    _buildIOSResultsForPatient(entry.key, entry.value)).toList()
-                  ),
+                  ...(_patientReports.entries
+                      .map(
+                        (entry) =>
+                            _buildIOSResultsForPatient(entry.key, entry.value),
+                      )
+                      .toList()),
                 ],
               ],
             ),
@@ -815,14 +1069,21 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
   }
 
   // Update the iOS results display similarly
-  Widget _buildIOSResultsForPatient(String patientName, Map<String, dynamic> patientData) {
+  Widget _buildIOSResultsForPatient(
+    String patientName,
+    Map<String, dynamic> patientData,
+  ) {
     final dates = (patientData['dates'] as Set<String>).toList()..sort();
     final results = List<Map<String, dynamic>>.from(patientData['results']);
-    final originalNames = (patientData['original_names'] as Set<String>).toList()..sort();
-    final displayName = originalNames.length > 1 
-        ? '$patientName (also known as: ${originalNames.where((n) => n != patientName).join(", ")})'
-        : patientName;
-    
+    final originalNames =
+        (patientData['original_names'] as Set<String>).toList()..sort();
+
+    // Only show original names if they're different from the normalized name
+    final displayName =
+        originalNames.length > 1
+            ? '${patientData['display_name']} (also known as: ${originalNames.where((n) => _normalizePatientName(n) != patientName).join(", ")})'
+            : patientData['display_name'] ?? patientName;
+
     return Container(
       decoration: BoxDecoration(
         color: CupertinoColors.systemBackground,
@@ -870,6 +1131,114 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
               ],
             ),
           ),
+          if (_selectedFiles.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Files',
+                    style: TextStyle(
+                      color: CupertinoColors.secondaryLabel,
+                      fontSize: 15,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children:
+                        _selectedFiles
+                            .where(
+                              (file) =>
+                                  file.name.contains(patientName) ||
+                                  dates.any((date) => file.name.contains(date)),
+                            )
+                            .map(
+                              (file) => Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 6,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: CupertinoColors.systemGrey6,
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const Icon(
+                                      CupertinoIcons.doc,
+                                      size: 16,
+                                      color: CupertinoColors.systemGrey,
+                                    ),
+                                    const SizedBox(width: 6),
+                                    Text(
+                                      file.name,
+                                      style: const TextStyle(
+                                        color: CupertinoColors.label,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    CupertinoButton(
+                                      padding: EdgeInsets.zero,
+                                      minSize: 0,
+                                      onPressed: () {
+                                        showCupertinoDialog(
+                                          context: context,
+                                          builder:
+                                              (context) => CupertinoAlertDialog(
+                                                title: const Text(
+                                                  'Delete File',
+                                                ),
+                                                content: Text(
+                                                  'Are you sure you want to delete ${file.name}?',
+                                                ),
+                                                actions: [
+                                                  CupertinoDialogAction(
+                                                    isDestructiveAction: true,
+                                                    onPressed: () {
+                                                      setState(() {
+                                                        _selectedFiles
+                                                            .removeWhere(
+                                                              (f) =>
+                                                                  f.name ==
+                                                                  file.name,
+                                                            );
+                                                      });
+                                                      Navigator.pop(context);
+                                                    },
+                                                    child: const Text('Delete'),
+                                                  ),
+                                                  CupertinoDialogAction(
+                                                    child: const Text('Cancel'),
+                                                    onPressed:
+                                                        () => Navigator.pop(
+                                                          context,
+                                                        ),
+                                                  ),
+                                                ],
+                                              ),
+                                        );
+                                      },
+                                      child: const Icon(
+                                        CupertinoIcons.xmark_circle_fill,
+                                        size: 16,
+                                        color: CupertinoColors.systemGrey,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            )
+                            .toList(),
+                  ),
+                ],
+              ),
+            ),
+          ],
           if (results.isNotEmpty)
             SingleChildScrollView(
               scrollDirection: Axis.horizontal,
@@ -887,9 +1256,7 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
 
   Widget _buildIOSSettingsPanel() {
     return CupertinoPageScaffold(
-      navigationBar: const CupertinoNavigationBar(
-        middle: Text('Settings'),
-      ),
+      navigationBar: const CupertinoNavigationBar(middle: Text('Settings')),
       child: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(16.0),
@@ -898,10 +1265,7 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
             children: [
               const Text(
                 'API Configuration',
-                style: TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.bold,
-                ),
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 16),
               CupertinoTextField(
@@ -910,9 +1274,7 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                 obscureText: true,
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
-                  border: Border.all(
-                    color: CupertinoColors.systemGrey4,
-                  ),
+                  border: Border.all(color: CupertinoColors.systemGrey4),
                   borderRadius: BorderRadius.circular(8),
                 ),
               ),
@@ -922,16 +1284,17 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                   dotenv.env['GEMINI_API_KEY'] = _apiKeyController.text;
                   showCupertinoDialog(
                     context: context,
-                    builder: (context) => CupertinoAlertDialog(
-                      title: const Text('Success'),
-                      content: const Text('API Key saved'),
-                      actions: [
-                        CupertinoDialogAction(
-                          child: const Text('OK'),
-                          onPressed: () => Navigator.pop(context),
+                    builder:
+                        (context) => CupertinoAlertDialog(
+                          title: const Text('Success'),
+                          content: const Text('API Key saved'),
+                          actions: [
+                            CupertinoDialogAction(
+                              child: const Text('OK'),
+                              onPressed: () => Navigator.pop(context),
+                            ),
+                          ],
                         ),
-                      ],
-                    ),
                   );
                 },
                 child: const Text('Save API Key'),
@@ -951,7 +1314,7 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
       // Keep existing Material Design implementation
       final isSmallScreen = MediaQuery.of(context).size.width < 600;
       final isLargeScreen = MediaQuery.of(context).size.width >= 900;
-      
+
       return Scaffold(
         body: Row(
           children: [
@@ -971,7 +1334,9 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                     if (index == 1) {
                       Navigator.push(
                         context,
-                        MaterialPageRoute(builder: (context) => const DatabaseExample()),
+                        MaterialPageRoute(
+                          builder: (context) => const DatabaseExample(),
+                        ),
                       ).then((_) {
                         setState(() {
                           _selectedIndex = 0;
@@ -991,9 +1356,10 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                             maxWidth: _isExtended ? 250 : 72,
                           ),
                           child: Row(
-                            mainAxisAlignment: _isExtended 
-                                ? MainAxisAlignment.spaceBetween
-                                : MainAxisAlignment.center,
+                            mainAxisAlignment:
+                                _isExtended
+                                    ? MainAxisAlignment.spaceBetween
+                                    : MainAxisAlignment.center,
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               if (_isExtended) ...[
@@ -1026,7 +1392,10 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                           padding: const EdgeInsets.symmetric(horizontal: 16),
                           child: Text(
                             'Medical Report\nAnalyzer',
-                            style: Theme.of(context).textTheme.titleMedium,
+                            style:
+                                CupertinoTheme.of(
+                                  context,
+                                ).textTheme.navTitleTextStyle,
                             textAlign: TextAlign.center,
                           ),
                         ),
@@ -1048,7 +1417,7 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                   ],
                 ),
               ),
-            if (!isSmallScreen) 
+            if (!isSmallScreen)
               AnimatedContainer(
                 duration: const Duration(milliseconds: 200),
                 child: VerticalDivider(thickness: 1, width: 1),
@@ -1067,7 +1436,9 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                         if (index == 1) {
                           Navigator.push(
                             context,
-                            MaterialPageRoute(builder: (context) => const DatabaseExample()),
+                            MaterialPageRoute(
+                              builder: (context) => const DatabaseExample(),
+                            ),
                           ).then((_) {
                             setState(() {
                               _selectedIndex = 0;
@@ -1091,9 +1462,10 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                       ],
                     ),
                   Expanded(
-                    child: _selectedIndex == 2
-                        ? _buildSettingsPanel()
-                        : _buildAnalysisPanel(),
+                    child:
+                        _selectedIndex == 2
+                            ? _buildSettingsPanel()
+                            : _buildAnalysisPanel(),
                   ),
                 ],
               ),
@@ -1133,7 +1505,8 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                           decoration: const InputDecoration(
                             labelText: 'Google Gemini API Key',
                             border: OutlineInputBorder(),
-                            helperText: 'Enter your API key from Google AI Studio',
+                            helperText:
+                                'Enter your API key from Google AI Studio',
                           ),
                           obscureText: true,
                           keyboardType: TextInputType.text,
@@ -1145,7 +1518,8 @@ class _ImageAnalyzerPageState extends State<ImageAnalyzerPage> {
                         FilledButton.icon(
                           onPressed: () {
                             // Save API key to .env file
-                            dotenv.env['GEMINI_API_KEY'] = _apiKeyController.text;
+                            dotenv.env['GEMINI_API_KEY'] =
+                                _apiKeyController.text;
                             ScaffoldMessenger.of(context).showSnackBar(
                               const SnackBar(content: Text('API Key saved')),
                             );
