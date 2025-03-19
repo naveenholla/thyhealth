@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:file_picker/file_picker.dart';
 import '../database/medical_repository.dart';
+import '../database/database.dart';
 
 /// Service to handle medical report operations
 class ReportService {
@@ -57,12 +58,12 @@ class ReportService {
   }
   
   /// Get all patients
-  Future<List<dynamic>> getAllPatients() async {
+  Future<List<Patient>> getAllPatients() async {
     return await _repository.getAllPatients();
   }
   
   /// Get all reports for a patient
-  Future<List<dynamic>> getReportsByPatientId(int patientId) async {
+  Future<List<dynamic>> getReportsForPatient(int patientId) async {
     return await _repository.getReportsByPatientId(patientId);
   }
   
@@ -89,5 +90,29 @@ class ReportService {
   /// Close the database
   Future<void> closeDatabase() async {
     await _repository.closeDatabase();
+  }
+
+  /// Debug: Print all reports for a patient
+  Future<void> debugPrintAllReports(int patientId) async {
+    final reports = await getReportsForPatient(patientId);
+    print('Debug: Found ${reports.length} reports for patient $patientId');
+    for (var report in reports) {
+      print('Report: $report');
+    }
+  }
+
+  /// Get a patient by ID
+  Future<Patient?> getPatient(int patientId) async {
+    final patients = await getAllPatients();
+    try {
+      return patients.firstWhere((patient) => patient.id == patientId);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /// Update a patient's information
+  Future<void> updatePatient(Patient patient) async {
+    await _repository.updatePatient(patient);
   }
 } 

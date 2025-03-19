@@ -150,6 +150,18 @@ class MedicalRepository {
     await _provider.closeDatabase();
   }
 
+  /// Update a patient's information
+  Future<void> updatePatient(Patient patient) async {
+    final db = await _provider.database;
+    await db.transaction(() async {
+      await (db.update(db.patients)..where((p) => p.id.equals(patient.id)))
+          .write(PatientsCompanion(
+        name: Value(patient.name),
+        // Add other fields as needed
+      ));
+    });
+  }
+
   /// Helper method to determine if a test result is abnormal
   bool _isAbnormalResult(String result, String? referenceRange) {
     if (referenceRange == null) return false;

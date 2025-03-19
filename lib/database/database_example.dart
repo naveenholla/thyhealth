@@ -130,7 +130,7 @@ class _DatabaseExampleState extends State<DatabaseExample> {
     }
 
     return FutureBuilder<List<dynamic>>(
-      future: _reportService.getReportsByPatientId(_selectedPatientId!),
+      future: _reportService.getReportsForPatient(_selectedPatientId!),
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Center(child: CircularProgressIndicator());
